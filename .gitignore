@@ -1,0 +1,6 @@
+# Build products: `./build.sh` recreates them.
+.build/
+build/
+# Disk images are published as GitHub releases instead.
+releases/
+.DS_Store

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>Volume Control</string>
+	<key>CFBundleExecutable</key>
+	<string>VolumeControl</string>
+	<key>CFBundleIdentifier</key>
+	<string>dev.alper.VolumeControl</string>
+	<key>CFBundleName</key>
+	<string>Volume Control</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.4.2</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>15.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Volume Control routes each app's audio through itself so it can play it back at the volume you choose. Nothing is recorded or saved.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Volume Control never uses the microphone. macOS may ask because some headsets combine speakers and a microphone in one device.</string>
+</dict>
+</plist>
