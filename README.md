@@ -43,6 +43,10 @@ Click the slider icon in the menu bar.
 - **Quit**: stops all routing immediately; every app plays normally. Saved volumes and the on/off switch are
   remembered and apply again the next time Volume Control starts.
 
+With more than four apps in the list, only the ones you're likely to want are shown: FaceTime, apps that are
+playing or played in the last five minutes, and apps with a custom volume. The rest are under **Show N more
+apps**.
+
 Apps that aren't running keep their setting and are shown dimmed. The FaceTime slider covers calls, which macOS
 plays through the `avconferenced` background process, and the ringtone.
 

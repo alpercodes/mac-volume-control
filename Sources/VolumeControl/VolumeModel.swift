@@ -24,6 +24,9 @@ struct AppRow: Identifiable, Equatable {
     let volume: Double
     let muted: Bool
     let error: String?
+    /// Worth showing straight away: FaceTime, and apps that are playing, played recently or have a custom volume.
+    /// The rest are folded away under "Show N more apps" once the list gets long.
+    let isProminent: Bool
 }
 
 @MainActor
@@ -34,6 +37,8 @@ final class VolumeModel: ObservableObject {
     /// Tallest the app list may get before it scrolls; set from the screen's height.
     @Published var maxListHeight: CGFloat = 420
     @Published private(set) var permission = AudioCapturePermission.status
+    /// Whether the apps folded away under "Show N more apps" are shown. Folded again whenever the panel closes.
+    @Published var showsAllApps = false
     /// When off, no audio is routed through the app and every app plays at its normal volume.
     @Published private(set) var isEnabled = UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true
 
@@ -44,6 +49,11 @@ final class VolumeModel: ObservableObject {
         /// A process using the microphone and the speakers at once: FaceTime, Zoom, WhatsApp and the like.
         var isInCall = false
     }
+
+    /// Up to this many rows, everything is shown; a longer list folds away the apps that aren't prominent.
+    private static let unfoldedRowLimit = 4
+    /// An app that went quiet stays prominent this long, so pausing a video doesn't hide its slider.
+    private static let recentlyPlayedInterval: TimeInterval = 5 * 60
 
     private static let settingsKey = "appSettings"
     private static let enabledKey = "enabled"
@@ -65,10 +75,19 @@ final class VolumeModel: ObservableObject {
     /// Last IO-cycle count seen per tap, and since when it has been that value (for stall detection).
     private var lastIOCycles: [String: (cycles: UInt64, since: Date)] = [:]
     private var lastPermissionCheck = Date.distantPast
+    private var lastPlayed: [String: Date] = [:]
+    private var panelIsOpen = false
 
     private var systemListeners: [PropertyListener] = []
     private var deviceListeners: [PropertyListener] = []
-    private var processListeners: [AudioObjectID: [PropertyListener]] = [:]
+    /// Per process object, with the PID they were added for: Core Audio reuses object IDs, and a listener doesn't
+    /// carry over to the next process that gets the same ID.
+    private var processListeners: [AudioObjectID: (pid: pid_t, listeners: [PropertyListener])] = [:]
+    private var safetyRefreshTimer: Timer?
+    /// Core Audio's "started playing" notifications don't always arrive (seen after waking from sleep: an app played
+    /// for minutes unnoticed), so the state is also re-read this often. A handful of property reads; with the
+    /// tolerance, macOS folds the wake-up into others.
+    private static let safetyRefreshInterval: TimeInterval = 15
     private var callActive = false
     private var outputDevice = AudioDeviceID.unknown
     private var outputDeviceSignature = ""
@@ -96,6 +115,7 @@ final class VolumeModel: ObservableObject {
             },
         ].compactMap { $0 }
         outputDeviceChanged()
+        updateSafetyRefresh()
         // Each new build is a new app to macOS, so after an update it asks again. Ask now rather than when a saved
         // volume is first needed (System Settings may still show the old build's permission as on).
         if isEnabled && !settings.isEmpty && permission == .unknown {
@@ -176,7 +196,21 @@ final class VolumeModel: ObservableObject {
         failures.removeAll()
         errors.removeAll()
         if !enabled { stopAll() }
-        reconcileAll()
+        updateSafetyRefresh()
+        refresh()
+    }
+
+    /// Only while on: turned off, nothing depends on knowing who's playing until the panel opens, which re-reads too.
+    private func updateSafetyRefresh() {
+        safetyRefreshTimer?.invalidate()
+        safetyRefreshTimer = nil
+        guard isEnabled else { return }
+        let timer = Timer(timeInterval: Self.safetyRefreshInterval, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refresh() }
+        }
+        timer.tolerance = Self.safetyRefreshInterval / 3
+        RunLoop.main.add(timer, forMode: .common)
+        safetyRefreshTimer = timer
     }
 
     func refreshPermission() {
@@ -268,17 +302,18 @@ final class VolumeModel: ObservableObject {
     private func refresh() {
         let processes = AudioProcess.all()
 
-        let current = Set(processes.map(\.objectID))
-        for (id, listeners) in processListeners where !current.contains(id) {
-            listeners.forEach { $0.remove() }
+        let current = Dictionary(processes.map { ($0.objectID, $0.pid) }, uniquingKeysWith: { first, _ in first })
+        for (id, entry) in processListeners where current[id] != entry.pid {
+            entry.listeners.forEach { $0.remove() }
             processListeners[id] = nil
         }
-        for id in current where processListeners[id] == nil {
-            processListeners[id] = [kAudioProcessPropertyIsRunningOutput, kAudioProcessPropertyIsRunningInput].compactMap {
+        for (id, pid) in current where processListeners[id] == nil {
+            let listeners = [kAudioProcessPropertyIsRunningOutput, kAudioProcessPropertyIsRunningInput].compactMap {
                 id.addListener($0) { [weak self] in
                     MainActor.assumeIsolated { self?.scheduleRefresh() }
                 }
             }
+            processListeners[id] = (pid, listeners)
         }
 
         var groups: [String: AppGroup] = [:]
@@ -485,7 +520,7 @@ final class VolumeModel: ObservableObject {
         lastIOCycles.removeAll()
         pendingTeardowns.values.forEach { $0.item.cancel() }
         pendingTeardowns.removeAll()
-        processListeners.values.joined().forEach { $0.remove() }
+        processListeners.values.forEach { $0.listeners.forEach { $0.remove() } }
         processListeners.removeAll()
         failures.removeAll()
         errors.removeAll()
@@ -540,27 +575,58 @@ final class VolumeModel: ObservableObject {
 
     // MARK: - Rows
 
+    /// The apps folded away under "Show N more apps".
+    var otherRows: [AppRow] { rows.filter { !$0.isProminent } }
+
+    /// Folding one app away saves no room, and a short list doesn't need it.
+    var foldsOtherRows: Bool { rows.count > Self.unfoldedRowLimit && otherRows.count > 1 }
+
+    var visibleRows: [AppRow] { foldsOtherRows && !showsAllApps ? rows.filter(\.isProminent) : rows }
+
+    /// The list is only rearranged while the panel is closed (see `rebuildRows`), and opens folded.
+    func setPanelOpen(_ open: Bool) {
+        panelIsOpen = false
+        if open {
+            refresh()  // Never show a stale picture of who's playing.
+        } else {
+            showsAllApps = false
+            rebuildRows()
+        }
+        panelIsOpen = open
+    }
+
     private func rebuildRows() {
         var keys = Set(groups.filter { $0.value.isRunningOutput || $0.value.identity.isApp }.keys)
         keys.formUnion(settings.keys)
         keys.insert(AppIdentity.faceTimeKey)
 
+        let now = Date()
+        for (key, group) in groups where group.isRunningOutput { lastPlayed[key] = now }
+        let wasProminent = Dictionary(uniqueKeysWithValues: self.rows.map { ($0.id, $0.isProminent) })
+        let wasVisible = Set(visibleRows.map(\.id))
+
         let rows = keys.map { key -> AppRow in
             let group = groups[key]
-            let setting = settings[key]
+            let setting = settings[key]  // Only custom volumes are stored.
             let status: AppRow.Status = group == nil ? .notRunning : group!.isRunningOutput ? .playing : .silent
+            let playedRecently = lastPlayed[key].map { now.timeIntervalSince($0) < Self.recentlyPlayedInterval } ?? false
+            var isProminent = key == AppIdentity.faceTimeKey || setting != nil || playedRecently || errors[key] != nil
+            // While the panel is open, a row that's on screen stays in its section, so it can't jump away from under
+            // the pointer (say, a folded-out app whose slider leaves 100%). A hidden row can still come forward.
+            if panelIsOpen, let was = wasProminent[key], was || wasVisible.contains(key) { isProminent = was }
             return AppRow(id: key,
                           name: group?.identity.name ?? setting?.name ?? (key == AppIdentity.faceTimeKey ? "FaceTime" : key),
                           status: status,
                           volume: setting?.volume ?? 1,
                           muted: setting?.muted ?? false,
-                          error: errors[key])
+                          error: errors[key],
+                          isProminent: isProminent)
         }
         .sorted { a, b in
             // Playing and silent apps share a rank so rows don't jump around while you drag a slider.
             func rank(_ row: AppRow) -> Int {
                 if row.id == AppIdentity.faceTimeKey { return 0 }
-                return row.status == .notRunning ? 2 : 1
+                return (row.isProminent ? 0 : 10) + (row.status == .notRunning ? 2 : 1)
             }
             return (rank(a), a.name.localizedLowercase) < (rank(b), b.name.localizedLowercase)
         }

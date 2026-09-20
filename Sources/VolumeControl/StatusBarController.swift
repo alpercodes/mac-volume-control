@@ -23,7 +23,7 @@ final class StatusBarController: NSObject {
         self.model = model
         super.init()
 
-        panel = MenuPanel(rootView: MenuView(model: model))
+        panel = MenuPanel(rootView: MenuView(model: model, fitPanel: { [weak self] in self?.panel.fitNow() }))
         panel.onClose = { [weak self] in self?.panelDidClose() }
 
         if let button = statusItem.button {
@@ -74,6 +74,7 @@ final class StatusBarController: NSObject {
         guard !panel.isVisible else { return }
         removeClickMonitor()  // In case the panel was hidden behind our back, e.g. by Hide Others.
         model.refreshPermission()
+        model.setPanelOpen(true)
         if let screen = statusItem.button?.window?.screen ?? NSScreen.main {
             // Leave room for the header and footer so the panel never reaches under the Dock.
             model.maxListHeight = max(150, min(420, screen.visibleFrame.height - 180))
@@ -106,6 +107,7 @@ final class StatusBarController: NSObject {
     /// Called however the panel was dismissed: by a click on the icon, a click outside, Escape, or Quit.
     private func panelDidClose() {
         lastCloseTime = Date()
+        model.setPanelOpen(false)
         setHighlighted(false)
         removeClickMonitor()
         if #available(macOS 27.0, *) {
@@ -256,8 +258,15 @@ final class MenuPanel: NSPanel {
         contentView?.layoutSubtreeIfNeeded()
     }
 
-    /// Fits outside of SwiftUI's layout pass, and once more after any animation has settled, so the panel never
-    /// stops at an in-between size.
+    /// Fits right away, for a change made by the user: SwiftUI applies the pending change during the layout, and the
+    /// panel takes its new size before anything is drawn.
+    func fitNow() {
+        contentView?.layoutSubtreeIfNeeded()
+        fitToContent()
+    }
+
+    /// For changes that come from elsewhere (an app starts playing). Fits outside of SwiftUI's layout pass, and once
+    /// more after any animation has settled, so the panel never stops at an in-between size.
     func scheduleFit() {
         guard isVisible, !fitScheduled else { return }
         fitScheduled = true

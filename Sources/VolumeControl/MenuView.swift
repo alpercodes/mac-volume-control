@@ -2,6 +2,17 @@ import SwiftUI
 
 struct MenuView: View {
     @ObservedObject var model: VolumeModel
+    /// Called right after a change that gives the content a new height, to resize the panel along with it.
+    var fitPanel: () -> Void = {}
+
+    /// Changes the layout without animation and resizes the panel in the same screen refresh. Left to the panel's
+    /// own size tracking, the resize comes a frame late, and the content flickers in the old-sized panel meanwhile.
+    private func resizing(_ change: () -> Void) {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction, change)
+        fitPanel()
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -10,10 +21,7 @@ struct MenuView: View {
                     .font(.headline)
                 Spacer()
                 Toggle("Enabled", isOn: Binding(get: { model.isEnabled }, set: { enabled in
-                    // Change the layout in one step so the panel resizes straight to the final size.
-                    var transaction = Transaction()
-                    transaction.disablesAnimations = true
-                    withTransaction(transaction) { model.setEnabled(enabled) }
+                    resizing { model.setEnabled(enabled) }
                 }))
                     .toggleStyle(.switch)
                     .labelsHidden()
@@ -35,7 +43,13 @@ struct MenuView: View {
             // height for the list to spread into.
             ScrollView {
                 VStack(spacing: 14) {
-                    ForEach(model.rows) { row in
+                    ForEach(model.visibleRows.filter(\.isProminent)) { row in
+                        AppVolumeRow(row: row, model: model)
+                    }
+                    if model.foldsOtherRows {
+                        OtherAppsToggle(model: model) { resizing { model.showsAllApps.toggle() } }
+                    }
+                    ForEach(model.visibleRows.filter { !$0.isProminent }) { row in
                         AppVolumeRow(row: row, model: model)
                     }
                 }
@@ -65,6 +79,38 @@ struct MenuView: View {
         .padding(16)
         .frame(width: 320)
         .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// Folds the apps that aren't prominent in and out: "Show 6 more apps", with their names underneath.
+private struct OtherAppsToggle: View {
+    @ObservedObject var model: VolumeModel
+    let toggle: () -> Void
+
+    var body: some View {
+        let others = model.otherRows
+        Button(action: toggle) {
+            HStack(spacing: 10) {
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .rotationEffect(.degrees(model.showsAllApps ? 90 : 0))
+                    .frame(width: 28)  // Lines up with the app icons.
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(model.showsAllApps ? "Show fewer apps" : "Show \(others.count) more apps")
+                        .font(.callout)
+                    if !model.showsAllApps {
+                        Text(others.map(\.name).joined(separator: ", "))
+                            .font(.caption2)
+                            .lineLimit(1)
+                    }
+                }
+                Spacer()
+            }
+            .foregroundStyle(.secondary)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(model.showsAllApps ? "" : "Apps that aren't playing and are at 100%")
     }
 }
 

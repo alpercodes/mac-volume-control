@@ -3,6 +3,19 @@
 Newest first. Every version's disk image is on the
 [releases page](https://github.com/alpercodes/mac-volume-control/releases).
 
+## 0.5 — 2026-09-20
+
+- A long app list folds up. FaceTime, apps that are playing or played in the last five minutes, and apps with a
+  custom volume are always shown; once there are more than four rows, the rest go under **Show N more apps**,
+  with their names underneath. While the panel is open, rows on screen keep their place, so an app doesn't jump
+  to another section while you drag its slider. The list is folded again each time the panel opens.
+- The panel takes its new size in the same screen refresh as its content when you fold the list or flip the
+  on/off switch. It used to follow a frame later, which showed as a flicker.
+- Fixed: an app could play for minutes without being noticed (not shown as playing, slider without effect),
+  because Core Audio's "started playing" notification doesn't always arrive, seen after waking from sleep. While
+  on, the app now also re-reads who's playing every 15 s, and whenever the panel opens or it's switched on.
+  Listeners are also re-added when Core Audio reuses a process object's ID for a different process.
+
 ## 0.4.2 — 2026-09-20
 
 - The menu bar icon stays highlighted while the panel is open. On macOS 27 the menu bar draws status items
