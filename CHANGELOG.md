@@ -3,6 +3,13 @@
 Newest first. Every version's disk image is on the
 [releases page](https://github.com/alpercodes/mac-volume-control/releases).
 
+## 0.5.2 — 2026-09-21
+
+- Fixed: after pausing for more than 15 seconds, a resumed video played at the wrong volume until the next
+  15-second check. macOS 27 doesn't announce that a process started or stopped playing under the property the
+  app listened to; it announces it as "is running" and as a change of the process's device list. The app listens
+  to those now, so a saved volume applies the moment playback starts. The 15-second check stays as a backstop.
+
 ## 0.5.1 — 2026-09-20
 
 - FaceTime is no longer pinned to the top of the list. It's sorted by name like every other app, and is still

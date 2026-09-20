@@ -83,10 +83,21 @@ final class VolumeModel: ObservableObject {
     /// Per process object, with the PID they were added for: Core Audio reuses object IDs, and a listener doesn't
     /// carry over to the next process that gets the same ID.
     private var processListeners: [AudioObjectID: (pid: pid_t, listeners: [PropertyListener])] = [:]
+    /// What to listen to on a process to learn that it started or stopped playing or recording. macOS 27 never
+    /// announces changes of IsRunningOutput and IsRunningInput themselves (seen with a listener for every property),
+    /// only of IsRunning and of the device lists. The device lists also cover a process that is already playing and
+    /// starts recording, i.e. a call.
+    private static let playbackProperties: [(AudioObjectPropertySelector, AudioObjectPropertyScope)] = [
+        (kAudioProcessPropertyIsRunning, kAudioObjectPropertyScopeGlobal),
+        (kAudioProcessPropertyDevices, kAudioObjectPropertyScopeOutput),
+        (kAudioProcessPropertyDevices, kAudioObjectPropertyScopeInput),
+        (kAudioProcessPropertyIsRunningOutput, kAudioObjectPropertyScopeGlobal),
+        (kAudioProcessPropertyIsRunningInput, kAudioObjectPropertyScopeGlobal),
+    ]
     private var safetyRefreshTimer: Timer?
-    /// Core Audio's "started playing" notifications don't always arrive (seen after waking from sleep: an app played
-    /// for minutes unnoticed), so the state is also re-read this often. A handful of property reads; with the
-    /// tolerance, macOS folds the wake-up into others.
+    /// A backstop for notifications that don't arrive (seen after waking from sleep: an app played for minutes
+    /// unnoticed), so the state is also re-read this often. A handful of property reads; with the tolerance, macOS
+    /// folds the wake-up into others.
     private static let safetyRefreshInterval: TimeInterval = 15
     private var callActive = false
     private var outputDevice = AudioDeviceID.unknown
@@ -308,8 +319,8 @@ final class VolumeModel: ObservableObject {
             processListeners[id] = nil
         }
         for (id, pid) in current where processListeners[id] == nil {
-            let listeners = [kAudioProcessPropertyIsRunningOutput, kAudioProcessPropertyIsRunningInput].compactMap {
-                id.addListener($0) { [weak self] in
+            let listeners = Self.playbackProperties.compactMap { selector, scope in
+                id.addListener(selector, scope: scope) { [weak self] in
                     MainActor.assumeIsolated { self?.scheduleRefresh() }
                 }
             }
