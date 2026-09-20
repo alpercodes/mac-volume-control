@@ -70,9 +70,27 @@ exempt from call ducking. A tap is removed 15 seconds after its app goes quiet, 
 longer needed (the app is back at 100% outside a call), and immediately when you turn Volume Control off or quit
 it. If Volume Control crashes, macOS unmutes the apps automatically.
 
+### Undocumented interfaces
+
+Two things here have no public API, and both are in the code with a comment explaining them:
+
+- **Opting out of ducking** (`kAudioDevicePropertyProcessDuckOptOut`, the `'nodk'` device property) is what keeps
+  audio played through Volume Control from being turned down by the call it's playing. Without it, routing a
+  FaceTime call through the app would have the call duck itself. If a future macOS drops the property, the app
+  logs a warning and everything still works, just quieter during calls.
+- **Asking about the System Audio Recording permission** (`TCCAccessPreflight` and `TCCAccessRequest` for
+  `kTCCServiceAudioCapture`, from the private TCC framework) is the only way to know whether permission was
+  granted; Apple's own sample code for process taps uses the same two calls. If they disappear, the app assumes
+  it has access and lets macOS put up its prompt when a tap is first read.
+
+Relying on these means the app can't be distributed through the Mac App Store.
+
 ## Building from source
 
-Only the Xcode Command Line Tools are needed (`xcode-select --install`).
+Building needs the **macOS 27 SDK** — Command Line Tools 27 (`xcode-select --install`) or Xcode 27 — because the
+menu bar panel uses `NSStatusItemExpandedInterfaceSession`, which was introduced in macOS 27. The app that comes
+out runs on macOS 15 and newer; only the toolchain has to be current. There's no Xcode project and no
+dependencies.
 
 ```sh
 ./build.sh           # builds build/Volume Control.app and releases/Volume Control <version>.dmg
