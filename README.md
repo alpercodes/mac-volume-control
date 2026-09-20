@@ -1,7 +1,7 @@
 # Volume Control
 
-A menu bar app for macOS that gives every app its own volume slider (0–200%), with FaceTime pinned at the top.
-Volumes are remembered per app, so FaceTime is back at your level on every call.
+A menu bar app for macOS that gives every app its own volume slider (0–200%), FaceTime calls included. Volumes
+are remembered per app, so FaceTime is back at your level on every call.
 
 Requires macOS 15 or newer. Runs on both Apple silicon and Intel Macs.
 

@@ -3,6 +3,11 @@
 Newest first. Every version's disk image is on the
 [releases page](https://github.com/alpercodes/mac-volume-control/releases).
 
+## 0.5.1 — 2026-09-20
+
+- FaceTime is no longer pinned to the top of the list. It's sorted by name like every other app, and is still
+  always listed, so the call volume can be set before a call.
+
 ## 0.5 — 2026-09-20
 
 - A long app list folds up. FaceTime, apps that are playing or played in the last five minutes, and apps with a

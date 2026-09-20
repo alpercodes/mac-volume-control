@@ -625,8 +625,7 @@ final class VolumeModel: ObservableObject {
         .sorted { a, b in
             // Playing and silent apps share a rank so rows don't jump around while you drag a slider.
             func rank(_ row: AppRow) -> Int {
-                if row.id == AppIdentity.faceTimeKey { return 0 }
-                return (row.isProminent ? 0 : 10) + (row.status == .notRunning ? 2 : 1)
+                (row.isProminent ? 0 : 10) + (row.status == .notRunning ? 1 : 0)
             }
             return (rank(a), a.name.localizedLowercase) < (rank(b), b.name.localizedLowercase)
         }
