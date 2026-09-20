@@ -1,7 +1,9 @@
 # Volume Control
 
-A menu bar app for macOS that gives every app its own volume slider (0–200%), FaceTime calls included. Volumes
-are remembered per app, so FaceTime is back at your level on every call.
+A menu bar app for macOS that gives every app its own volume slider, from 0 to 200%. Turn a game down under your
+music, boost a quiet video, or set a call's volume apart from everything else. Volumes are remembered per app.
+
+It also stops macOS from turning your other apps down while you're on a call.
 
 Requires macOS 15 or newer. Runs on both Apple silicon and Intel Macs.
 
@@ -123,3 +125,7 @@ Logs: `/usr/bin/log stream --level debug --predicate 'subsystem == "dev.alper.Vo
 ## Changes
 
 See [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+[MIT](LICENSE)
