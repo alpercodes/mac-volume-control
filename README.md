@@ -5,6 +5,29 @@ Volumes are remembered per app, so FaceTime is back at your level on every call.
 
 Requires macOS 15 or newer. Runs on both Apple silicon and Intel Macs.
 
+## Installing
+
+Download the newest disk image from the
+[releases page](https://github.com/alpercodes/mac-volume-control/releases), then:
+
+1. Open the disk image and drag **Volume Control** onto the **Applications** shortcut next to it.
+2. Open it from Applications. macOS says it can't verify the app, because it's signed ad hoc rather than with a
+   paid Apple Developer account. Click **Done**.
+3. Go to **System Settings → Privacy & Security**, scroll down and click **Open Anyway**.
+4. Allow **System Audio Recording** when asked. That permission is how the app takes an app's audio and plays it
+   back at your volume. Nothing is recorded or saved.
+
+### Updating
+
+Quit Volume Control (menu bar icon → Quit), open the new disk image, drag the app onto Applications and choose
+**Replace**. Steps 2–4 are needed again for every build: macOS treats each one as a new app, so it asks for the
+audio permission again even though System Settings may still list "Volume Control" as allowed (that entry belongs
+to the previous build). Click **Allow** in the prompt, or **Allow…** in the app's panel.
+
+If an old copy ends up beside the new one anyway (e.g. "Volume Control 2"), the new version offers to move the
+old one to the Trash, and it always quits any other copy that's still running, so two copies never handle the
+same audio.
+
 ## Using it
 
 Click the slider icon in the menu bar.
@@ -23,18 +46,20 @@ Click the slider icon in the menu bar.
 Apps that aren't running keep their setting and are shown dimmed. The FaceTime slider covers calls, which macOS
 plays through the `avconferenced` background process, and the ringtone.
 
-The first time you set an app away from 100%, macOS asks for **System Audio Recording** permission. The app
-needs it to take an app's audio and play it back at your volume. Nothing is recorded or saved. If you denied
-it, enable "Volume Control" in System Settings → Privacy & Security → Screen & System Audio Recording.
-
-**During calls:** macOS turns every other app down while you're on a call (FaceTime, and other calling apps), by
-up to 15 dB, and keeps changing the amount as people talk. While Volume Control is on, that doesn't happen: every
-app plays at the volume it would have without a call, times its slider. Turn Volume Control off (the switch at the
-top) to get macOS's normal lowering back. A call is detected as an app using the microphone and the speakers at the
-same time.
+The first time you set an app away from 100%, macOS asks for System Audio Recording permission. If you denied it,
+enable "Volume Control" in System Settings → Privacy & Security → Screen & System Audio Recording, or use the
+**Allow…** button in the app's panel.
 
 Your normal volume controls (keyboard keys, Control Center, AirPods) keep working as usual. They set the overall
 level, and the app sets each app's level relative to it.
+
+### During calls
+
+macOS turns every other app down while you're on a call (FaceTime, and other calling apps), by up to 15 dB, and
+keeps changing the amount as people talk. While Volume Control is on, that doesn't happen: every app plays at the
+volume it would have without a call, times its slider. Turn Volume Control off (the switch at the top) to get
+macOS's normal lowering back. A call is detected as an app using the microphone and the speakers at the same
+time.
 
 ## How it works
 
@@ -45,35 +70,7 @@ exempt from call ducking. A tap is removed 15 seconds after its app goes quiet, 
 longer needed (the app is back at 100% outside a call), and immediately when you turn Volume Control off or quit
 it. If Volume Control crashes, macOS unmutes the apps automatically.
 
-## Versions
-
-The version is `CFBundleShortVersionString` in `Resources/Info.plist`; bump it before building a release. Each
-version's disk image is kept in `releases/`.
-
-- **0.1**: first stable version.
-- **0.2**: shipped as a disk image instead of a zip; quits any other running copy and offers to trash older copies
-  after an update; remembers "Open at Login" across updates; lighter on battery (safety check every 5 s instead of
-  2 s, audio released 15 s after an app goes quiet instead of 30 s).
-- **0.3**: audio from helper processes that macOS doesn't attribute to their app is now matched to the app by its
-  bundle ID (e.g. "Google Chrome Helper" → Chrome, WhatsApp's call extension → WhatsApp), so those apps get their own
-  slider and aren't left quieter than Safari during calls.
-- **0.3.1**: after an update, asks for the audio permission at launch, and the permission banner's button shows
-  the macOS prompt ("Allow…") instead of sending you to System Settings, which can still show the previous version
-  as allowed.
-- **0.4**:
-  - While routing audio, the permission is re-checked every 30 s instead of every 5 s. Opening the panel still
-    checks right away.
-  - Right after waking from sleep, audio that hasn't resumed yet is no longer mistaken for a stall (which rebuilt
-    the audio path and could cause a blip). The app also re-syncs which apps are playing on wake.
-  - **Reset All** button: every app back to 100% and unmuted.
-- **0.4.1**: clicking the menu bar icon while the panel is open now closes it (the click used to close and
-  immediately reopen it).
-- **0.4.2**: the menu bar icon stays highlighted while the panel is open. On macOS 27 the menu bar draws the
-  status item itself, so the app now hands the panel to it (`NSStatusItemExpandedInterfaceSession`) the way the
-  system's own menu bar panels do: the menu bar highlights the icon, closes the panel on the next click, and
-  includes it in menu bar keyboard navigation. Older versions of macOS keep the previous behaviour.
-
-## Building
+## Building from source
 
 Only the Xcode Command Line Tools are needed (`xcode-select --install`).
 
@@ -82,29 +79,14 @@ Only the Xcode Command Line Tools are needed (`xcode-select --install`).
 ./build.sh install   # also copies it to ~/Applications and launches it
 ```
 
-The app is signed ad hoc, so macOS may ask for the audio permission again after each rebuild.
+The build is universal (Apple silicon and Intel) and signed ad hoc, so macOS asks for the audio permission again
+after each rebuild.
+
+The version is `CFBundleShortVersionString` in `Resources/Info.plist`; bump it and add an entry to
+[CHANGELOG.md](CHANGELOG.md) before building a release. `build/` and `releases/` aren't tracked; disk images are
+published on the releases page.
 
 Logs: `/usr/bin/log stream --level debug --predicate 'subsystem == "dev.alper.VolumeControl"'`
-
-## Sharing it with someone
-
-Send the newest disk image from `releases/`, e.g. `Volume Control 0.4.2.dmg` (AirDrop, Messages, iCloud Drive).
-On their Mac:
-
-1. Double-click the disk image and drag **Volume Control** onto the **Applications** shortcut next to it.
-2. Open it from Applications. macOS says it can't verify the app, because it isn't signed with a paid Apple
-   Developer account. Click **Done**.
-3. Go to **System Settings → Privacy & Security**, scroll down and click **Open Anyway**.
-4. Allow **System Audio Recording** when asked.
-
-macOS treats every new build as a new app, so after each update it asks for the audio permission again, even
-though System Settings may still show "Volume Control" as allowed (that entry is the previous build's). Click
-**Allow** in the prompt, or **Allow…** in the app's panel.
-
-**Updating:** quit Volume Control (menu bar icon → Quit), open the new disk image, drag the app onto Applications
-and choose **Replace**. Steps 2–4 are needed again for every new build. If an old copy ends up next to the new one
-anyway (e.g. "Volume Control 2"), the new version offers to move the old one to the Trash, and it always quits any
-other copy that's still running, so two copies never handle the same audio.
 
 ## Known limitations
 
@@ -115,3 +97,7 @@ other copy that's still running, so two copies never handle the same audio.
 - When audio starts, the first fraction of a second can play at the original volume before the tap takes over.
 - On a FaceTime call on speakers (not headphones), changing the call volume might affect echo cancellation for
   the other person. If they hear an echo, use headphones or set FaceTime back to 100%.
+
+## Changes
+
+See [CHANGELOG.md](CHANGELOG.md).
