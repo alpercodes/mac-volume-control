@@ -5,14 +5,36 @@ import os
 
 let log = Logger(subsystem: "dev.alper.VolumeControl", category: "audio")
 
-/// Saved per-app volume. Only apps whose volume differs from 100% (or are muted) are stored.
+/// Saved per-app volume. Only apps with something changed are stored.
 struct AppSetting: Codable, Equatable {
     var name: String
     var volume: Double = 1
     var muted = false
+    /// The volume during calls, set by dragging the slider during one and applied to every call after. Without it,
+    /// calls use the normal volume if that was changed, and otherwise leave the app to macOS, which may lower it.
+    var callVolume: Double?
+    var callMuted = false
+
+    init(name: String) { self.name = name }
+
+    init(from decoder: Decoder) throws {  // Settings saved before call volumes existed lack those keys.
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        volume = try container.decodeIfPresent(Double.self, forKey: .volume) ?? 1
+        muted = try container.decodeIfPresent(Bool.self, forKey: .muted) ?? false
+        callVolume = try container.decodeIfPresent(Double.self, forKey: .callVolume)
+        callMuted = try container.decodeIfPresent(Bool.self, forKey: .callMuted) ?? false
+    }
 
     var gain: Float { muted ? 0 : Float(volume) }
-    var isDefault: Bool { volume == 1 && !muted }
+    var hasNormalVolume: Bool { volume != 1 || muted }
+    var hasCallVolume: Bool { callVolume != nil || callMuted }
+    var isDefault: Bool { !hasNormalVolume && !hasCallVolume }
+
+    /// The volume and mute state the app has during calls.
+    var callLevel: (volume: Double, muted: Bool) {
+        hasCallVolume ? (callVolume ?? volume, callMuted) : (volume, muted)
+    }
 }
 
 struct AppRow: Identifiable, Equatable {
@@ -21,8 +43,23 @@ struct AppRow: Identifiable, Equatable {
     let id: String
     let name: String
     let status: Status
+    /// What the slider shows: the call volume during a call, the normal volume otherwise.
     let volume: Double
     let muted: Bool
+    /// Whether the percentage button has something to reset (the call volume during a call).
+    let canReset: Bool
+    let callState: CallState
+    /// Outside calls: the volume set for calls, if any ("50%", "muted").
+    let savedCallVolume: String?
+
+    enum CallState: Equatable {
+        case none
+        /// Playing at the volume set for calls.
+        case callVolume
+        /// Left to macOS, which lowers other apps during a call: to `volume` if that could be measured, otherwise
+        /// by an unknown amount (and `volume` is its normal one).
+        case lowered(measured: Bool)
+    }
     let error: String?
     /// Worth showing straight away: FaceTime, and apps that are playing, played recently or have a custom volume.
     /// The rest are folded away under "Show N more apps" once the list gets long.
@@ -39,6 +76,8 @@ final class VolumeModel: ObservableObject {
     @Published private(set) var permission = AudioCapturePermission.status
     /// Whether the apps folded away under "Show N more apps" are shown. Folded again whenever the panel closes.
     @Published var showsAllApps = false
+    /// Whether an app is in a call; sliders then set the volume for calls.
+    @Published private(set) var callActive = false
     /// When off, no audio is routed through the app and every app plays at its normal volume.
     @Published private(set) var isEnabled = UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true
 
@@ -46,8 +85,12 @@ final class VolumeModel: ObservableObject {
         let identity: AppIdentity
         var objectIDs: Set<AudioObjectID> = []
         var isRunningOutput = false
-        /// A process using the microphone and the speakers at once: FaceTime, Zoom, WhatsApp and the like.
-        var isInCall = false
+        var isRunningInput = false
+        /// The devices its processes play to.
+        var outputDevices: Set<AudioDeviceID> = []
+        /// Using the microphone and the speakers at once: FaceTime, Zoom, WhatsApp, a call in the browser and the
+        /// like. Counted per app, not per process: an app may record in one process and play in another.
+        var isInCall: Bool { isRunningOutput && isRunningInput }
     }
 
     /// Up to this many rows, everything is shown; a longer list folds away the apps that aren't prominent.
@@ -74,12 +117,20 @@ final class VolumeModel: ObservableObject {
     private var pendingTeardowns: [String: (item: DispatchWorkItem, deadline: DispatchTime)] = [:]
     /// Last IO-cycle count seen per tap, and since when it has been that value (for stall detection).
     private var lastIOCycles: [String: (cycles: UInt64, since: Date)] = [:]
+    /// Last audible IO cycle seen per tap, since when, and whether a long silence was logged. Silence is normal
+    /// (a quiet moment in a call), but a tap that captures nothing for minutes while the app plays is worth a line
+    /// in the log when someone reports hearing nothing.
+    private var silence: [String: (cycle: UInt64, since: Date, reported: Bool)] = [:]
+    private static let silenceReportInterval: TimeInterval = 60
     private var lastPermissionCheck = Date.distantPast
+    /// Measures how far macOS lowers apps during a call, while that's on screen.
+    private let duckingMeter = DuckingMeter()
     private var lastPlayed: [String: Date] = [:]
     private var panelIsOpen = false
 
     private var systemListeners: [PropertyListener] = []
-    private var deviceListeners: [PropertyListener] = []
+    /// Format listeners for the default output and every device a tap plays to, with the format last seen.
+    private var devices: [AudioDeviceID: (signature: String, listeners: [PropertyListener])] = [:]
     /// Per process object, with the PID they were added for: Core Audio reuses object IDs, and a listener doesn't
     /// carry over to the next process that gets the same ID.
     private var processListeners: [AudioObjectID: (pid: pid_t, listeners: [PropertyListener])] = [:]
@@ -99,10 +150,11 @@ final class VolumeModel: ObservableObject {
     /// unnoticed), so the state is also re-read this often. A handful of property reads; with the tolerance, macOS
     /// folds the wake-up into others.
     private static let safetyRefreshInterval: TimeInterval = 15
-    private var callActive = false
+    private var lastCallSeen = Date.distantPast
+    private var callEndCheckScheduled = false
+    private static let callEndDelay: TimeInterval = 3
+    /// The default output device.
     private var outputDevice = AudioDeviceID.unknown
-    private var outputDeviceSignature = ""
-    private var deviceGeneration = 0
     private var refreshScheduled = false
     private var hasRequestedPermission = false
     private var watchdogTimer: Timer?
@@ -114,6 +166,7 @@ final class VolumeModel: ObservableObject {
 
     init() {
         loadSettings()
+        duckingMeter.onChange = { [weak self] in self?.rebuildRows() }
         systemListeners = [
             AudioObjectID.system.addListener(kAudioHardwarePropertyProcessObjectList) { [weak self] in
                 MainActor.assumeIsolated { self?.scheduleRefresh() }
@@ -150,6 +203,7 @@ final class VolumeModel: ObservableObject {
     private func didWake() {
         log.notice("Woke from sleep")
         lastIOCycles.removeAll()
+        recheckDeviceFormats()
         scheduleRefresh()  // In case a process started or stopped playing without every notification arriving.
         guard !taps.isEmpty else { return }
         // A baseline reading now, and a verdict once a stall could count, instead of waiting for the regular timer.
@@ -162,24 +216,51 @@ final class VolumeModel: ObservableObject {
 
     /// True when some app has a custom volume that can't be applied for lack of permission.
     var needsPermission: Bool {
-        isEnabled && permission != .authorized && (!settings.isEmpty || callActive)
+        isEnabled && permission != .authorized && !settings.isEmpty
     }
 
     // MARK: - User actions
 
+    /// During a call this sets the app's volume for calls, which every later call uses too; the normal volume stays.
     func setVolume(_ volume: Double, for row: AppRow) {
+        if callActive {
+            // Back where it would be without a volume for calls (the level macOS lowers it to, or its normal
+            // volume): forget the volume for calls rather than keep a copy of that.
+            let without = levelWithoutCallVolume(row.id)
+            if !without.muted, abs(volume - without.volume) < 0.03 { return forgetCallVolume(row) }
+        }
         // Snap to 100% so it's easy to get back to "unchanged".
         let volume = abs(volume - 1) < 0.03 ? 1 : min(max(volume, 0), Self.maxVolume)
-        update(row) { $0.volume = volume; if volume > 0 { $0.muted = false } }
+        if callActive {
+            update(row) { $0.callVolume = volume; if volume > 0 { $0.callMuted = false } }
+        } else {
+            update(row) { $0.volume = volume; if volume > 0 { $0.muted = false } }
+        }
     }
 
     func toggleMute(_ row: AppRow) {
-        update(row) { setting in
-            if setting.muted || setting.volume == 0 {
-                setting.muted = false
-                if setting.volume == 0 { setting.volume = 1 }
-            } else {
-                setting.muted = true
+        if callActive {
+            update(row) { setting in
+                let level = setting.callLevel
+                if level.muted || level.volume == 0 {
+                    // Back to the volume for calls, or to what applies without one; only if that's silent too
+                    // (normally muted, say), a volume for calls at the normal volume (100% if that's 0).
+                    setting.callMuted = false
+                    if setting.callVolume == 0 { setting.callVolume = nil }
+                    let unmuted = setting.callLevel
+                    if unmuted.muted || unmuted.volume == 0 { setting.callVolume = setting.volume > 0 ? setting.volume : 1 }
+                } else {
+                    setting.callMuted = true
+                }
+            }
+        } else {
+            update(row) { setting in
+                if setting.muted || setting.volume == 0 {
+                    setting.muted = false
+                    if setting.volume == 0 { setting.volume = 1 }
+                } else {
+                    setting.muted = true
+                }
             }
         }
     }
@@ -195,8 +276,13 @@ final class VolumeModel: ObservableObject {
         reconcileAll()
     }
 
+    /// During a call, forgets the app's volume for calls; otherwise sets its normal volume back to 100%.
     func reset(_ row: AppRow) {
-        update(row) { $0.volume = 1; $0.muted = false }
+        if callActive { forgetCallVolume(row) } else { update(row) { $0.volume = 1; $0.muted = false } }
+    }
+
+    func forgetCallVolume(_ row: AppRow) {
+        update(row) { $0.callVolume = nil; $0.callMuted = false }
     }
 
     func setEnabled(_ enabled: Bool) {
@@ -217,7 +303,10 @@ final class VolumeModel: ObservableObject {
         safetyRefreshTimer = nil
         guard isEnabled else { return }
         let timer = Timer(timeInterval: Self.safetyRefreshInterval, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.refresh() }
+            MainActor.assumeIsolated {
+                self?.recheckDeviceFormats()
+                self?.refresh()
+            }
         }
         timer.tolerance = Self.safetyRefreshInterval / 3
         RunLoop.main.add(timer, forMode: .common)
@@ -282,6 +371,13 @@ final class VolumeModel: ObservableObject {
     private func update(_ row: AppRow, _ change: (inout AppSetting) -> Void) {
         var setting = settings[row.id] ?? AppSetting(name: row.name)
         change(&setting)
+        if callActive, setting.hasCallVolume {
+            let level = setting.callLevel, without = levelWithoutCallVolume(row.id)
+            if level.muted == without.muted, level.muted || abs(level.volume - without.volume) < 0.001 {
+                setting.callVolume = nil
+                setting.callMuted = false
+            }
+        }
         settings[row.id] = setting.isDefault ? nil : setting
         saveSettings()
         // Touching the slider retries a tap that failed (at most once a second while dragging).
@@ -292,7 +388,6 @@ final class VolumeModel: ObservableObject {
         if !setting.isDefault && isEnabled {
             requestPermissionIfNeeded()
         }
-        taps[row.id]?.gain = setting.gain
         reconcile(row.id)
         rebuildRows()
     }
@@ -311,7 +406,7 @@ final class VolumeModel: ObservableObject {
     }
 
     private func refresh() {
-        let processes = AudioProcess.all()
+        let processes = AudioProcess.all(excluding: duckingMeter.helperPID.map { [$0] } ?? [])
 
         let current = Dictionary(processes.map { ($0.objectID, $0.pid) }, uniquingKeysWith: { first, _ in first })
         for (id, entry) in processListeners where current[id] != entry.pid {
@@ -330,81 +425,175 @@ final class VolumeModel: ObservableObject {
         var groups: [String: AppGroup] = [:]
         for process in processes {
             let identity = AppIdentity.of(process)
-            groups[identity.key, default: AppGroup(identity: identity)].objectIDs.insert(process.objectID)
-            if process.isRunningOutput { groups[identity.key]?.isRunningOutput = true }
-            if process.isRunningOutput && process.isRunningInput { groups[identity.key]?.isInCall = true }
+            var group = groups[identity.key] ?? AppGroup(identity: identity)
+            group.objectIDs.insert(process.objectID)
+            group.isRunningOutput = group.isRunningOutput || process.isRunningOutput
+            group.isRunningInput = group.isRunningInput || process.isRunningInput
+            group.outputDevices.formUnion(process.outputDevices)
+            groups[identity.key] = group
         }
         self.groups = groups
-        let callActive = groups.values.contains { $0.isInCall }
+        // A calling app can stop its speaker or microphone for a moment (muting in the call, say); the call lasts
+        // until it has been over for a few seconds, so volumes don't swap back and forth.
+        let now = Date()
+        if groups.values.contains(where: \.isInCall) { lastCallSeen = now }
+        let callActive = now.timeIntervalSince(lastCallSeen) < Self.callEndDelay
+        if callActive && !groups.values.contains(where: \.isInCall) && !callEndCheckScheduled {
+            callEndCheckScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.callEndDelay + 0.1) { [weak self] in
+                MainActor.assumeIsolated {
+                    self?.callEndCheckScheduled = false
+                    self?.refresh()
+                }
+            }
+        }
         if callActive != self.callActive {
             self.callActive = callActive
-            log.notice("Call \(callActive ? "started" : "ended", privacy: .public)")
+            if !callActive { duckingMeter.forgetLevels() }
+            let callers = groups.values.filter(\.isInCall).map(\.identity.key).sorted()
+            log.notice("Call \(callActive ? "started" : "ended", privacy: .public) \(callers, privacy: .public)")
         }
 
         reconcileAll()
     }
 
     private func outputDeviceChanged() {
-        deviceListeners.forEach { $0.remove() }
         outputDevice = (try? AudioObjectID.defaultOutputDevice()) ?? .unknown
-        outputDeviceSignature = outputDevice.formatSignature()
-        deviceGeneration += 1
-        log.notice("Output device is now \(self.outputDevice) (\(self.outputDeviceSignature, privacy: .public))")
-
-        // Sample-rate or channel changes (e.g. AirPods switching to call mode) invalidate our aggregate devices.
-        // Only real changes count, so notifications caused by our own aggregate devices can't trigger rebuild loops.
-        let bump = { [weak self] in
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                let signature = self.outputDevice.formatSignature()
-                guard signature != self.outputDeviceSignature else { return }
-                self.outputDeviceSignature = signature
-                self.deviceGeneration += 1
-                log.notice("Output device format changed (\(signature, privacy: .public))")
-                self.scheduleRefresh()
-            }
-        }
-        deviceListeners = [
-            outputDevice.addListener(kAudioDevicePropertyNominalSampleRate, bump),
-            outputDevice.addListener(kAudioDevicePropertyStreamConfiguration, scope: kAudioObjectPropertyScopeOutput, bump),
-            outputDevice.addListener(kAudioDevicePropertyStreamConfiguration, scope: kAudioObjectPropertyScopeInput, bump),
-            outputDevice.addListener(kAudioDevicePropertyDeviceIsAlive, bump),
-        ].compactMap { $0 }
-
+        let signature = watchedSignature(of: outputDevice)
+        log.notice("Output device is now \(self.outputDevice) (\(signature, privacy: .public))")
         refresh()
     }
 
-    private func gain(for key: String) -> Float {
-        settings[key]?.gain ?? 1
+    /// The device's format: as last seen by its listeners if it's followed, otherwise read now.
+    private func signature(of device: AudioDeviceID) -> String {
+        devices[device]?.signature ?? (device.isValid ? device.formatSignature() : "")
+    }
+
+    /// The device's format, following its changes from now on (until `forgetUnusedDevices`).
+    private func watchedSignature(of device: AudioDeviceID) -> String {
+        if let known = devices[device] { return known.signature }
+        guard device.isValid else { return "" }
+
+        // Sample-rate or channel changes (e.g. AirPods switching to call mode) invalidate our aggregate devices.
+        let bump = { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.recheckFormat(of: device) else { return }
+                self.scheduleRefresh()
+            }
+        }
+        let listeners = [
+            device.addListener(kAudioDevicePropertyNominalSampleRate, bump),
+            device.addListener(kAudioDevicePropertyStreamConfiguration, scope: kAudioObjectPropertyScopeOutput, bump),
+            device.addListener(kAudioDevicePropertyStreamConfiguration, scope: kAudioObjectPropertyScopeInput, bump),
+            device.addListener(kAudioDevicePropertyDeviceIsAlive, bump),
+        ].compactMap { $0 }
+        let signature = device.formatSignature()
+        devices[device] = (signature, listeners)
+        return signature
+    }
+
+    /// Only real changes count, so notifications caused by our own aggregate devices can't trigger rebuild loops.
+    /// Returns whether the format changed.
+    private func recheckFormat(of device: AudioDeviceID) -> Bool {
+        guard let known = devices[device] else { return false }
+        let signature = device.formatSignature()
+        guard signature != known.signature else { return false }
+        devices[device]?.signature = signature
+        log.notice("Format of device \(device) changed (\(signature, privacy: .public))")
+        return true
+    }
+
+    /// For format changes whose notification didn't arrive (as some don't around sleep); the refresh that follows
+    /// rebuilds what they affect.
+    private func recheckDeviceFormats() {
+        for device in devices.keys { _ = recheckFormat(of: device) }
+    }
+
+    /// Stops following devices that neither are the default output nor have a tap playing to them.
+    private func forgetUnusedDevices() {
+        let inUse = Set(taps.values.map(\.outputDevice)).union([outputDevice])
+        for (device, entry) in devices where !inUse.contains(device) {
+            entry.listeners.forEach { $0.remove() }
+            devices[device] = nil
+        }
+    }
+
+    /// Where the app's audio is played back while it runs through us: the device the app plays to itself, which
+    /// isn't always the default output (Google Meet, Zoom and many other apps let you pick a speaker). A tap mutes
+    /// the app everywhere, so playing it anywhere else would take it away from, say, the headset the call is on. A
+    /// tap can only play to one device, so when the app plays to several (or it can't be told yet), the default.
+    private func tapDevice(for key: String, _ group: AppGroup) -> AudioDeviceID {
+        let devices = Set(group.outputDevices.flatMap { $0.playbackDevices() })
+        // Stay put while the current device is still one of them, so a second stream (a notification sound on
+        // another device, say) doesn't move the tap back and forth.
+        if let current = taps[key]?.outputDevice, devices.contains(current) { return current }
+        return devices.count == 1 ? devices.first! : outputDevice
+    }
+
+    /// How macOS lowers the app during this call if it has no volume for calls: not at all (no call, the calling app,
+    /// not playing, or it has a custom normal volume, which we keep playing), or to the measured level, which is only
+    /// known for apps playing to the default output, where the meter runs (nil elsewhere, or not measured yet).
+    private enum Lowering { case none, lowered(Double?) }
+
+    private func lowering(_ key: String) -> Lowering {
+        guard callActive, let group = groups[key], group.isRunningOutput, !group.isInCall,
+              settings[key]?.hasNormalVolume != true else { return .none }
+        let devices = Set(group.outputDevices.flatMap { $0.playbackDevices() })
+        let onDefaultOutput = devices.isEmpty || devices == [outputDevice]
+        return .lowered(onDefaultOutput ? duckingMeter.level.map { ($0 * 100).rounded() / 100 } : nil)
+    }
+
+    /// What the app's row shows during this call without a volume for calls.
+    private func levelWithoutCallVolume(_ key: String) -> (volume: Double, muted: Bool) {
+        if case .lowered(let level) = lowering(key) { return (level ?? 1, false) }
+        return (settings[key]?.volume ?? 1, settings[key]?.muted ?? false)
+    }
+
+    /// The gain the user chose for the app right now, or nil if it's left alone.
+    ///
+    /// During calls, calling apps make macOS turn other audio down ("ducking", up to 15 dB). An app nobody changed
+    /// is left to that. One with a volume for calls, or a custom normal volume, plays at exactly that through us,
+    /// which macOS doesn't duck. The calling app itself isn't ducked, so at 100% it needs nothing.
+    private func chosenGain(_ key: String, _ group: AppGroup) -> Float? {
+        guard let setting = settings[key] else { return nil }
+        if callActive {
+            let level = setting.callLevel
+            let gain: Float = level.muted ? 0 : Float(level.volume)
+            if setting.hasCallVolume { return group.isInCall && gain == 1 ? nil : gain }
+        }
+        return setting.hasNormalVolume ? setting.gain : nil
     }
 
     /// Whether the app's audio should run through us right now.
-    ///
-    /// Besides apps with a custom volume, that's every other app during a call: calling apps make macOS turn all
-    /// other audio down ("ducking", up to 15 dB). Audio we play is exempt from that, so while Volume Control is on,
-    /// everything sounds the way it does without a call. Turned off, macOS ducks as usual.
     private func needsTap(_ key: String, _ group: AppGroup) -> Bool {
-        guard group.isRunningOutput else { return false }
-        return gain(for: key) != 1 || (callActive && !group.isInCall && group.identity.isApp)
+        group.isRunningOutput && chosenGain(key, group) != nil
     }
 
     private func reconcileAll() {
         for key in Set(groups.keys).union(taps.keys) {
             reconcile(key)
         }
+        forgetUnusedDevices()
+        updateDuckingMeter()
         rebuildRows()
+    }
+
+    /// The level macOS lowers apps to is only measured while it's on screen: during a call, with the panel open.
+    private func updateDuckingMeter() {
+        let wanted = isEnabled && callActive && panelIsOpen && permission == .authorized
+        duckingMeter.measure(on: wanted ? outputDevice : nil)
     }
 
     /// Creates, updates or removes the tap for one app so it matches the app's setting and playback state.
     private func reconcile(_ key: String) {
-        let gain = gain(for: key)
         guard isEnabled, let group = groups[key], outputDevice.isValid else {
             errors[key] = nil
             teardown(key)
             return
         }
 
-        if needsTap(key, group) {
+        let chosen = chosenGain(key, group)
+        if group.isRunningOutput, let gain = chosen {
             cancelTeardown(key)
             if permission != .authorized {
                 // Never tap without permission: the app would be muted and we'd only receive silence.
@@ -415,28 +604,37 @@ final class VolumeModel: ObservableObject {
                     return
                 }
             }
-            ensureTap(for: key, group: group, gain: gain)
+            ensureTap(for: key, group: group, device: tapDevice(for: key, group), gain: gain)
         } else {
             errors[key] = nil
             guard let tap = taps[key] else { return }
             // Keep the tap around for a bit so pausing and resuming doesn't briefly play at full volume.
-            if tap.deviceGeneration != deviceGeneration || tap.processObjectIDs != group.objectIDs {
+            if tap.processObjectIDs != group.objectIDs {
+                // A process joined or left while the app is quiet; keep the tap for its resume if that's possible.
+                try? tap.updateProcesses(group.objectIDs)
+            }
+            if tap.deviceSignature != signature(of: tap.outputDevice) || tap.processObjectIDs != group.objectIDs {
                 teardown(key)
             } else {
-                tap.gain = gain
-                // Quick when the tap isn't wanted at all any more; slow when the app has only gone quiet.
-                let wanted = gain != 1 || (callActive && !group.isInCall && group.identity.isApp)
-                scheduleTeardown(key, after: wanted ? Self.idleTeardownDelay : Self.resetTeardownDelay)
+                if chosen == nil && callActive && !group.isInCall {
+                    // Handed back to macOS during a call: it's lowered as soon as it's no longer played by us
+                    // (exempt from that), where a grace period would play it at full volume meanwhile.
+                    teardown(key)
+                    return
+                }
+                tap.gain = chosen ?? 1
+                // Slow when the app has only gone quiet; quick when the tap isn't wanted at all any more.
+                scheduleTeardown(key, after: chosen != nil ? Self.idleTeardownDelay : Self.resetTeardownDelay)
             }
         }
     }
 
-    private func signature(of group: AppGroup) -> String {
-        "\(group.objectIDs.sorted())/\(outputDevice)/\(deviceGeneration)"
+    private func signature(of group: AppGroup, on device: AudioDeviceID) -> String {
+        "\(group.objectIDs.sorted())/\(device)/\(signature(of: device))"
     }
 
-    private func ensureTap(for key: String, group: AppGroup, gain: Float) {
-        if let tap = taps[key], tap.outputDevice == outputDevice, tap.deviceGeneration == deviceGeneration {
+    private func ensureTap(for key: String, group: AppGroup, device: AudioDeviceID, gain: Float) {
+        if let tap = taps[key], tap.outputDevice == device, tap.deviceSignature == signature(of: device) {
             if tap.processObjectIDs != group.objectIDs {
                 do {
                     try tap.updateProcesses(group.objectIDs)
@@ -451,21 +649,23 @@ final class VolumeModel: ObservableObject {
             }
         }
 
-        let signature = signature(of: group)
+        let signature = signature(of: group, on: device)
         if let failure = failures[key], failure.signature == signature, Date() < failure.retryAt {
             teardown(key)
             return
         }
 
         // Build the new tap before removing the old one, so the app isn't briefly heard at full volume.
+        let deviceSignature = watchedSignature(of: device)
         let previous = taps.removeValue(forKey: key)
         lastIOCycles[key] = nil
+        silence[key] = nil
         do {
-            taps[key] = try VolumeTap(processObjectIDs: group.objectIDs, outputDevice: outputDevice,
-                                      deviceGeneration: deviceGeneration, gain: gain)
+            taps[key] = try VolumeTap(processObjectIDs: group.objectIDs, outputDevice: device,
+                                      deviceSignature: deviceSignature, gain: gain)
             errors[key] = nil
             failures[key] = nil
-            log.notice("Started tap for \(key, privacy: .public) (processes \(group.objectIDs.sorted(), privacy: .public), gain \(gain))")
+            log.notice("Started tap for \(key, privacy: .public) (processes \(group.objectIDs.sorted(), privacy: .public), device \(device)\(device == self.outputDevice ? " (default)" : "", privacy: .public), gain \(gain))")
         } catch {
             recordFailure(for: key, signature: signature, message: "\(error)")
         }
@@ -491,6 +691,7 @@ final class VolumeModel: ObservableObject {
     private func teardown(_ key: String) {
         cancelTeardown(key)
         lastIOCycles[key] = nil
+        silence[key] = nil
         guard let tap = taps.removeValue(forKey: key) else { return }
         tap.invalidate()
         log.notice("Stopped tap for \(key, privacy: .public)")
@@ -529,10 +730,13 @@ final class VolumeModel: ObservableObject {
         for tap in taps.values { tap.abandon() }
         taps.removeAll()
         lastIOCycles.removeAll()
+        silence.removeAll()
         pendingTeardowns.values.forEach { $0.item.cancel() }
         pendingTeardowns.removeAll()
         processListeners.values.forEach { $0.listeners.forEach { $0.remove() } }
         processListeners.removeAll()
+        devices.values.forEach { $0.listeners.forEach { $0.remove() } }
+        devices.removeAll()
         failures.removeAll()
         errors.removeAll()
         updateWatchdog()
@@ -559,10 +763,13 @@ final class VolumeModel: ObservableObject {
         let now = Date()
         if now.timeIntervalSince(lastPermissionCheck) >= Self.permissionCheckInterval {
             lastPermissionCheck = now
-            if AudioCapturePermission.status == .denied {
+            let status = AudioCapturePermission.status
+            if status != .authorized {
+                // Without it, taps only receive silence while the apps stay muted.
                 log.error("System Audio Recording permission was revoked; stopping all taps")
-                permission = .denied
+                permission = status
                 stopAll()
+                updateDuckingMeter()
                 rebuildRows()
                 return
             }
@@ -570,6 +777,17 @@ final class VolumeModel: ObservableObject {
         for (key, tap) in taps {
             let cycles = tap.ioCycles
             log.debug("\(key, privacy: .public): \(cycles) IO cycles, input peak \(tap.inputPeak), gain \(tap.gain)")
+            let audible = tap.lastAudibleCycle
+            if let entry = silence[key], entry.cycle == audible {
+                if !entry.reported, now.timeIntervalSince(entry.since) >= Self.silenceReportInterval,
+                   groups[key]?.isRunningOutput == true {
+                    silence[key]?.reported = true
+                    log.notice("Tap for \(key, privacy: .public) has captured only silence for \(Int(now.timeIntervalSince(entry.since)))s while the app plays (\(cycles) IO cycles)")
+                }
+            } else {
+                if silence[key]?.reported == true { log.notice("Tap for \(key, privacy: .public) captures audio again") }
+                silence[key] = (audible, now, false)
+            }
             guard let last = lastIOCycles[key], last.cycles == cycles else {
                 lastIOCycles[key] = (cycles, now)
                 continue
@@ -578,7 +796,7 @@ final class VolumeModel: ObservableObject {
             guard now.timeIntervalSince(last.since) >= Self.stallTimeout else { continue }
             teardown(key)
             if let group = groups[key] {
-                recordFailure(for: key, signature: signature(of: group), message: "Audio stopped flowing")
+                recordFailure(for: key, signature: signature(of: group, on: tap.outputDevice), message: "Audio stopped flowing")
             }
         }
         rebuildRows()
@@ -604,7 +822,10 @@ final class VolumeModel: ObservableObject {
             rebuildRows()
         }
         panelIsOpen = open
+        updateDuckingMeter()
     }
+
+    var hasSettings: Bool { !settings.isEmpty }
 
     private func rebuildRows() {
         var keys = Set(groups.filter { $0.value.isRunningOutput || $0.value.identity.isApp }.keys)
@@ -625,11 +846,31 @@ final class VolumeModel: ObservableObject {
             // While the panel is open, a row that's on screen stays in its section, so it can't jump away from under
             // the pointer (say, a folded-out app whose slider leaves 100%). A hidden row can still come forward.
             if panelIsOpen, let was = wasProminent[key], was || wasVisible.contains(key) { isProminent = was }
+
+            let hasNormalVolume = setting?.hasNormalVolume == true
+            let hasCallVolume = setting?.hasCallVolume == true
+            var volume = setting?.volume ?? 1
+            var muted = setting?.muted ?? false
+            var callState = AppRow.CallState.none
+            if callActive, let setting, hasCallVolume {
+                (volume, muted) = setting.callLevel
+                callState = .callVolume
+            } else if case .lowered(let level) = lowering(key) {
+                if let level { volume = level }
+                // Measured as (next to) not lowered: nothing to point out.
+                if (level ?? 0) < 0.99 { callState = .lowered(measured: level != nil) }
+            }
+            let savedCallVolume = callActive || !hasCallVolume ? nil
+                : setting!.callMuted ? "muted" : "\(Int(((setting!.callVolume ?? 1) * 100).rounded()))%"
+
             return AppRow(id: key,
                           name: group?.identity.name ?? setting?.name ?? (key == AppIdentity.faceTimeKey ? "FaceTime" : key),
                           status: status,
-                          volume: setting?.volume ?? 1,
-                          muted: setting?.muted ?? false,
+                          volume: volume,
+                          muted: muted,
+                          canReset: callActive ? hasCallVolume : hasNormalVolume,
+                          callState: callState,
+                          savedCallVolume: savedCallVolume,
                           error: errors[key],
                           isProminent: isProminent)
         }

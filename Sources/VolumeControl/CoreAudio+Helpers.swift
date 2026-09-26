@@ -103,6 +103,17 @@ extension AudioObjectID {
         return "\(rate)Hz out[\(formats.joined(separator: ","))] in\(inputs)"
     }
 
+    /// The real devices this one plays to: itself, or for an aggregate device (a Multi-Output device, or the private
+    /// one voice processing wraps around a call's microphone and speaker) its active sub-devices that have outputs.
+    func playbackDevices() -> [AudioDeviceID] {
+        let transport: UInt32 = (try? read(kAudioDevicePropertyTransportType, default: 0)) ?? 0
+        guard transport == kAudioDeviceTransportTypeAggregate || transport == kAudioDeviceTransportTypeAutoAggregate else {
+            return streamCount(scope: kAudioObjectPropertyScopeOutput) > 0 ? [self] : []
+        }
+        let subDevices = (try? readArray(kAudioAggregateDevicePropertyActiveSubDeviceList, element: AudioDeviceID.unknown)) ?? []
+        return subDevices.filter { $0.streamCount(scope: kAudioObjectPropertyScopeOutput) > 0 }
+    }
+
     /// Zero-based output channel indexes the device uses for stereo left/right.
     func preferredStereoChannels() -> (left: Int, right: Int) {
         let channels = (try? readArray(kAudioDevicePropertyPreferredChannelsForStereo,

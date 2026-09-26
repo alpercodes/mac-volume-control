@@ -7,7 +7,8 @@ import Synchronization
 final class VolumeTap {
     private(set) var processObjectIDs: Set<AudioObjectID>
     let outputDevice: AudioDeviceID
-    let deviceGeneration: Int
+    /// The output device's format when the tap was built (see `formatSignature`); a tap doesn't survive a change.
+    let deviceSignature: String
 
     private let description: CATapDescription
     private var renderer: GainRenderer?
@@ -16,10 +17,10 @@ final class VolumeTap {
     private var aggregateID = AudioObjectID.unknown
     private var ioProcID: AudioDeviceIOProcID?
 
-    init(processObjectIDs: Set<AudioObjectID>, outputDevice: AudioDeviceID, deviceGeneration: Int, gain: Float) throws {
+    init(processObjectIDs: Set<AudioObjectID>, outputDevice: AudioDeviceID, deviceSignature: String, gain: Float) throws {
         self.processObjectIDs = processObjectIDs
         self.outputDevice = outputDevice
-        self.deviceGeneration = deviceGeneration
+        self.deviceSignature = deviceSignature
         self.initialGain = gain
         self.description = CATapDescription(stereoMixdownOfProcesses: processObjectIDs.sorted())
 
@@ -44,8 +45,12 @@ final class VolumeTap {
     /// Peak level of the captured audio in the most recent IO cycle (before gain).
     var inputPeak: Float { renderer?.inputPeak ?? 0 }
 
-    /// Number of IO cycles rendered so far, to tell a running tap from a stalled one.
-    var ioCycles: UInt64 { renderer?.ioCycles ?? 0 }
+    /// Number of IO cycles that played the tapped audio, to tell a working tap from a stalled one. Cycles that
+    /// couldn't (say, the device's layout changed under us) don't count: the app is muted all the same.
+    var ioCycles: UInt64 { renderer?.renderedCycles ?? 0 }
+
+    /// The last IO cycle that captured anything but digital silence (0 if none has yet).
+    var lastAudibleCycle: UInt64 { renderer?.lastAudibleCycle ?? 0 }
 
     /// Changes which processes are tapped without rebuilding, so the audio doesn't drop out or jump in volume.
     func updateProcesses(_ processObjectIDs: Set<AudioObjectID>) throws {
@@ -112,8 +117,7 @@ final class VolumeTap {
             log.warning("Tap runs at \(format.mSampleRate) Hz but the output device at \(deviceRate) Hz")
         }
 
-        let renderer = GainRenderer(gain: initialGain, tapBuffer: inputChannels.count - 1,
-                                    tapChannels: Int(format.mChannelsPerFrame), left: left, right: right)
+        let renderer = GainRenderer(gain: initialGain, tapChannels: Int(format.mChannelsPerFrame), left: left, right: right)
         self.renderer = renderer
         try check(AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggregateID, nil) { _, input, _, output, _ in
             renderer.render(input: input, output: output)
@@ -214,18 +218,18 @@ private final class GainRenderer: @unchecked Sendable {
     private let targetGainBits: Atomic<UInt32>
     private let inputPeakBits = Atomic<UInt32>(0)
     private let cycleCount = Atomic<UInt64>(0)
+    private let renderedCycleCount = Atomic<UInt64>(0)
+    private let lastAudibleCycleCount = Atomic<UInt64>(0)
     private var currentGain: Float  // IO thread only
 
     private let buffersOffset = MemoryLayout<AudioBufferList>.offset(of: \.mBuffers)!
-    private let tapBuffer: Int
     private let tapChannels: Int
     private let left: OutputChannel
     private let right: OutputChannel?
 
-    init(gain: Float, tapBuffer: Int, tapChannels: Int, left: OutputChannel, right: OutputChannel?) {
+    init(gain: Float, tapChannels: Int, left: OutputChannel, right: OutputChannel?) {
         targetGainBits = Atomic(gain.bitPattern)
         currentGain = gain
-        self.tapBuffer = tapBuffer
         self.tapChannels = tapChannels
         self.left = left
         self.right = right
@@ -237,7 +241,8 @@ private final class GainRenderer: @unchecked Sendable {
     }
 
     var inputPeak: Float { Float(bitPattern: inputPeakBits.load(ordering: .relaxed)) }
-    var ioCycles: UInt64 { cycleCount.load(ordering: .relaxed) }
+    var renderedCycles: UInt64 { renderedCycleCount.load(ordering: .relaxed) }
+    var lastAudibleCycle: UInt64 { lastAudibleCycleCount.load(ordering: .relaxed) }
 
     /// Hard clip at unity gain or below; above it, round off peaks so boosted audio doesn't crackle.
     @inline(__always)
@@ -268,7 +273,7 @@ private final class GainRenderer: @unchecked Sendable {
     }
 
     func render(input: UnsafePointer<AudioBufferList>, output: UnsafeMutablePointer<AudioBufferList>) {
-        cycleCount.add(1, ordering: .relaxed)
+        let cycle = cycleCount.add(1, ordering: .relaxed).newValue
 
         let (outBuffers, outCount) = buffers(UnsafePointer(output))
         for index in 0..<outCount {
@@ -277,8 +282,10 @@ private final class GainRenderer: @unchecked Sendable {
         }
 
         let (inBuffers, inCount) = buffers(input)
-        guard tapBuffer < inCount else { return }
-        let tap = inBuffers[tapBuffer]
+        // The tap is the aggregate's last input, after any of the device's own (which can appear, e.g. a headset's
+        // microphone once it switches to call mode).
+        guard inCount > 0 else { return }
+        let tap = inBuffers[inCount - 1]
         guard Int(tap.mNumberChannels) == tapChannels, let tapData = tap.mData else { return }
         let inData = tapData.assumingMemoryBound(to: Float.self)
         guard let (leftSamples, leftFrames) = samples(for: left, in: outBuffers, count: outCount) else { return }
@@ -312,5 +319,7 @@ private final class GainRenderer: @unchecked Sendable {
         }
         currentGain = target
         inputPeakBits.store(peak.bitPattern, ordering: .relaxed)
+        renderedCycleCount.add(1, ordering: .relaxed)
+        if peak > 0 { lastAudibleCycleCount.store(cycle, ordering: .relaxed) }
     }
 }

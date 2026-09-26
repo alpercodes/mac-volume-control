@@ -8,18 +8,24 @@ struct AudioProcess: Hashable {
     let bundleID: String?
     let isRunningOutput: Bool
     let isRunningInput: Bool
+    /// The devices it plays to (only read while it's playing).
+    let outputDevices: [AudioDeviceID]
 
-    static func all() -> [AudioProcess] {
+    /// Every process but this one and `excluded` (our own helpers).
+    static func all(excluding excluded: Set<pid_t> = []) -> [AudioProcess] {
         let ownPID = getpid()
         return ((try? AudioObjectID.processObjects()) ?? []).compactMap { id in
-            guard let pid: pid_t = try? id.read(kAudioProcessPropertyPID, default: -1), pid > 0, pid != ownPID else {
+            guard let pid: pid_t = try? id.read(kAudioProcessPropertyPID, default: -1), pid > 0, pid != ownPID,
+                  !excluded.contains(pid) else {
                 return nil
             }
             let bundleID = (try? id.readString(kAudioProcessPropertyBundleID)).flatMap { $0?.isEmpty == false ? $0 : nil }
             let running: UInt32 = (try? id.read(kAudioProcessPropertyIsRunningOutput, default: 0)) ?? 0
             let recording: UInt32 = (try? id.read(kAudioProcessPropertyIsRunningInput, default: 0)) ?? 0
+            let devices = running == 0 ? [] : (try? id.readArray(kAudioProcessPropertyDevices, scope: kAudioObjectPropertyScopeOutput,
+                                                                   element: AudioDeviceID.unknown)) ?? []
             return AudioProcess(objectID: id, pid: pid, bundleID: bundleID, isRunningOutput: running != 0,
-                                isRunningInput: recording != 0)
+                                isRunningInput: recording != 0, outputDevices: devices)
         }
     }
 }

@@ -19,6 +19,12 @@ struct MenuView: View {
             HStack {
                 Text("App Volume")
                     .font(.headline)
+                if model.callActive && model.isEnabled {
+                    Image(systemName: "phone.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .help("On a call: sliders set each app's volume for calls")
+                }
                 Spacer()
                 Toggle("Enabled", isOn: Binding(get: { model.isEnabled }, set: { enabled in
                     resizing { model.setEnabled(enabled) }
@@ -69,8 +75,8 @@ struct MenuView: View {
                     .toggleStyle(.checkbox)
                 Spacer()
                 Button("Reset All") { model.resetAll() }
-                    .disabled(!model.rows.contains { $0.volume != 1 || $0.muted })
-                    .help("Set every app back to 100%")
+                    .disabled(!model.hasSettings)
+                    .help("Set every app back to 100% and forget the volumes for calls")
                 Button("Quit") { NSApp.terminate(nil) }
                     .keyboardShortcut("q")
             }
@@ -119,7 +125,8 @@ private struct AppVolumeRow: View {
     let model: VolumeModel
 
     private var percent: Int { row.muted ? 0 : Int((row.volume * 100).rounded()) }
-    private var isChanged: Bool { row.muted || row.volume != 1 }
+    private var isChanged: Bool { row.canReset }
+    private var isLowered: Bool { if case .lowered = row.callState { true } else { false } }
 
     var body: some View {
         HStack(alignment: .center, spacing: 10) {
@@ -137,6 +144,12 @@ private struct AppVolumeRow: View {
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
+                    if row.callState == .callVolume {
+                        Image(systemName: "phone.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .help("Playing at its volume for calls")
+                    }
                     if let error = row.error {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .font(.caption)
@@ -145,13 +158,15 @@ private struct AppVolumeRow: View {
                     }
                     Spacer()
                     Button(action: { model.reset(row) }) {
-                        Text("\(percent)%")
+                        // Not measured: rather than a misleading 100%, say who sets its volume.
+                        Text(row.callState == .lowered(measured: false) ? "macOS" : "\(percent)%")
                             .monospacedDigit()
-                            .foregroundStyle(isChanged ? .primary : .secondary)
+                            .foregroundStyle((row.muted || row.volume != 1) && !isLowered ? .primary : .secondary)
+                            .italic(isLowered)
                     }
                     .buttonStyle(.plain)
                     .disabled(!isChanged)
-                    .help(isChanged ? "Reset to 100%" : "")
+                    .help(!isChanged ? "" : row.callState == .callVolume ? "Forget its volume for calls" : "Reset to 100%")
                 }
                 .font(.callout)
 
@@ -175,6 +190,19 @@ private struct AppVolumeRow: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
+                if let saved = row.savedCallVolume {
+                    HStack(spacing: 4) {
+                        Image(systemName: "phone.fill")
+                        Text("During calls: \(saved)")
+                        Button(action: { model.forgetCallVolume(row) }) {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Forget the volume for calls")
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -187,6 +215,11 @@ private struct AppVolumeRow: View {
     }
 
     private var subtitle: String? {
+        switch row.callState {
+        case .lowered(measured: true): return "Lowered by macOS for the call · drag to set"
+        case .lowered(measured: false): return "macOS may lower it for the call · drag to set"
+        default: break
+        }
         if row.id == AppIdentity.faceTimeKey {
             return row.status == .playing ? "Calls and ringtone" : "Applies to calls and the ringtone"
         }

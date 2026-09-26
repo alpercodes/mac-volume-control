@@ -3,7 +3,8 @@
 A menu bar app for macOS that gives every app its own volume slider, from 0 to 200%. Turn a game down under your
 music, boost a quiet video, or set a call's volume apart from everything else. Volumes are remembered per app.
 
-It also stops macOS from turning your other apps down while you're on a call.
+During calls it shows how far macOS turns your other apps down, and lets you set, per app, the volume it should
+have in every call.
 
 Requires macOS 15 or newer. Runs on both Apple silicon and Intel Macs.
 
@@ -40,7 +41,8 @@ Click the slider icon in the menu bar.
 - **Percentage**: click it to reset the app to 100%.
 - **Switch next to "App Volume"**: turns the whole thing off. Every app then plays normally, and your settings
   are kept for when you turn it back on. While it's off, the menu bar icon is struck through.
-- **Reset All**: puts every app back at 100% and unmuted, and forgets the saved volumes.
+- **Reset All**: puts every app back at 100% and unmuted, and forgets the saved volumes, including those for
+  calls.
 - **Open at Login**: starts the app automatically.
 - **Quit**: stops all routing immediately; every app plays normally. Saved volumes and the on/off switch are
   remembered and apply again the next time Volume Control starts.
@@ -62,19 +64,39 @@ level, and the app sets each app's level relative to it.
 ### During calls
 
 macOS turns every other app down while you're on a call (FaceTime, and other calling apps), by up to 15 dB, and
-keeps changing the amount as people talk. While Volume Control is on, that doesn't happen: every app plays at the
-volume it would have without a call, times its slider. Turn Volume Control off (the switch at the top) to get
-macOS's normal lowering back. A call is detected as an app using the microphone and the speakers at the same
-time.
+changes the amount as the call goes on. Volume Control leaves that alone for apps you haven't changed, and shows
+where they are: an app lowered to 40% shows 40%, in italics, marked "Lowered by macOS for the call".
+
+- **Dragging a slider during a call** sets that app's volume for calls. It plays steadily at that level, no
+  longer lowered by macOS, and the same level applies in every later call. Its normal volume isn't affected.
+  A phone symbol next to the name shows an app playing at its volume for calls.
+- **To give an app back to macOS**, drag it back to the lowered level, or click its percentage.
+- Outside calls, an app with a volume for calls shows it underneath ("During calls: 60%"), with a button to
+  forget it.
+- An app with a custom normal volume and no volume for calls keeps its normal volume during calls.
+
+A call is detected as an app using the microphone and the speakers at the same time. The lowering is measured by a
+small helper inside the app, only while you're on a call with the panel open (see
+[How it works](#how-it-works)); if it can't be measured (for an app playing to another device, or while the first measurement of a call is
+still being made), the app's percentage reads "macOS" instead. Once measured, the level is remembered for the rest
+of the call.
 
 ## How it works
 
-Outside calls, apps at 100% are never touched. When an app with a custom volume plays audio (or, during a call,
-any app that plays audio), Volume Control creates a Core Audio *process tap* for it. The tap mutes the app's own
-output and hands its audio to Volume Control, which plays it on the current output device at the chosen gain,
-exempt from call ducking. A tap is removed 15 seconds after its app goes quiet, a couple of seconds after it's no
-longer needed (the app is back at 100% outside a call), and immediately when you turn Volume Control off or quit
+Apps you haven't changed are never touched. When an app with a custom volume (or, during a call, a volume for
+calls) plays audio, Volume Control creates a Core Audio *process tap* for it. The tap mutes the app's own
+output and hands its audio to Volume Control, which plays it on the device the app plays to (the one picked in
+Meet or Zoom, say, or the system output) at the chosen gain, exempt from call ducking. A tap is removed 15 seconds after its app goes quiet, a couple of seconds after it's no
+longer needed (the app is back at 100%, or a call ended), and immediately when you turn Volume Control off or quit
 it. If Volume Control crashes, macOS unmutes the apps automatically.
+
+**Measuring macOS's call lowering.** macOS has no way to ask how far it's lowering other apps, and Volume Control
+can't measure it itself: its own playback is exempt from the lowering, and capturing a routed app gives its audio
+before the lowering. So during a call, while the panel is open, it runs a helper (`DuckMeter`, inside the app) that
+plays an inaudible tone (20 Hz at -80 dBFS) and captures its own share of the device's final mix, leaving every
+other process out, so nothing else is captured. For its first second the helper exempts itself from the lowering
+to learn the tone's full level there; after that, how far the tone comes through is how far macOS is lowering apps
+on that device. It measures the system output device; apps playing elsewhere show "macOS" as their percentage.
 
 ### Undocumented interfaces
 
@@ -114,10 +136,10 @@ Logs: `/usr/bin/log stream --level debug --predicate 'subsystem == "dev.alper.Vo
 
 ## Known limitations
 
-- While on, apps also aren't lowered by other things that duck audio, such as Siri speaking, as long as they're
-  playing through Volume Control (custom volume, or any app during a call).
-- An app that plays to a specific device (for example Zoom set to a USB headset rather than the system
-  output) is played on the system output device while its volume isn't 100%.
+- Apps playing through Volume Control (custom volume, or a volume for calls) also aren't lowered by other things
+  that duck audio, such as Siri speaking.
+- An app that plays to several devices at once (for example through a Multi-Output device) is played on the
+  system output device while its volume isn't 100%.
 - When audio starts, the first fraction of a second can play at the original volume before the tap takes over.
 - On a FaceTime call on speakers (not headphones), changing the call volume might affect echo cancellation for
   the other person. If they hear an echo, use headphones or set FaceTime back to 100%.
